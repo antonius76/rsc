@@ -1,0 +1,495 @@
+#!/bin/sh
+#
+# Kindle Touch/PaperWhite JailBreak Bridge
+#
+# $Id: bridge.sh 12225 2015-08-17 13:47:22Z NiLuJe $
+#
+##
+
+ROOT=""
+IS_TOUCH="false"
+IS_PW="false"
+IS_PW2="false"
+IS_KV="false"
+IS_KT2="false"
+IS_PW3="false"
+K5_ATLEAST_54="false"
+MKK_PERSISTENT_STORAGE="/var/local/mkk"
+RP_PERSISTENT_STORAGE="/var/local/rp"
+VARLOCAL_OOS="false"
+
+# Pull some helper functions for logging
+source /etc/upstart/functions
+
+LOG_DOMAIN="jb_bridge"
+
+logmsg()
+{
+	f_log "${1}" "${LOG_DOMAIN}" "${2}" "${3}" "${4}"
+}
+
+RW=
+mount_rw() {
+	if [ -z "$RW" ] ; then
+		RW=yes
+		mount -o rw,remount /
+	fi
+}
+
+mount_ro() {
+	if [ -n "$RW" ] ; then
+		RW=
+		mount -o ro,remount /
+	fi
+}
+
+mount_root_rw()
+{
+	DEV=`rdev | awk '{ print $1 }'`
+	if [ "${DEV}" != "/dev/mmcblk0p1" -a -n "${DEV}" ] ; then	# K4 doesn't have rdev on rootfs but does on diags, weird
+		ROOT="/tmp/root"
+		logmsg "I" "mount_root_rw" "" "We are not on rootfs, using ${ROOT}"
+		[ -d "${ROOT}" ] || mkdir "${ROOT}"
+		mount -o rw "/dev/mmcblk0p1" "${ROOT}"
+	else
+		logmsg "I" "mount_root_rw" "" "We are on rootfs"
+		mount_rw
+	fi
+}
+
+check_model()
+{
+	# Do the S/N dance...
+	kmodel="$(cut -c3-4 /proc/usid)"
+	case "${kmodel}" in
+		"24" | "1B" | "1D" | "1F" | "1C" | "20" )
+			# PaperWhite 1 (2012)
+			IS_PW="true"
+		;;
+		"D4" | "5A" | "D5" | "D6" | "D7" | "D8" | "F2" | "17" | "60" | "F4" | "F9" | "62" | "61" | "5F" )
+			# PaperWhite 2 (2013)
+			IS_PW="true"
+			IS_PW2="true"
+		;;
+		"13" | "54" | "2A" | "4F" | "52" | "53" )
+			# Voyage...
+			IS_KV="true"
+		;;
+		"C6" | "DD" )
+			# KT2...
+			IS_TOUCH="true"
+			IS_KT2="true"
+		;;
+		"0F" | "11" | "10" | "12" )
+			# Touch
+			IS_TOUCH="true"
+		;;
+		* )
+			# Try the new device ID scheme...
+			kmodel="$(cut -c4-6 /proc/usid)"
+			case "${kmodel}" in
+				"0G1" | "0G2" | "0G4" | "0G5" | "0G6" | "0G7" )
+					# PW3...
+					IS_PW3="true"
+				;;
+				* )
+					# Fallback... We shouldn't ever hit that.
+					IS_TOUCH="true"
+				;;
+			esac
+		;;
+	esac
+
+	# Use the proper constants for our screen...
+	if [ "${IS_KV}" == "true" -o "${IS_PW3}" == "true" ] ; then
+		SCREEN_X_RES=1088
+		SCREEN_Y_RES=1448
+		EIPS_X_RES=16
+		EIPS_Y_RES=24
+	elif [ "${IS_PW}" == "true" ] ; then
+		SCREEN_X_RES=768
+		SCREEN_Y_RES=1024
+		EIPS_X_RES=16
+		EIPS_Y_RES=24
+	elif [ "${IS_KT2}" == "true" ] ; then
+		SCREEN_X_RES=608
+		SCREEN_Y_RES=800
+		EIPS_X_RES=16
+		EIPS_Y_RES=24
+	else
+		SCREEN_X_RES=600
+		SCREEN_Y_RES=800
+		EIPS_X_RES=12
+		EIPS_Y_RES=20
+	fi
+	EIPS_MAXCHARS="$((${SCREEN_X_RES} / ${EIPS_X_RES}))"
+	EIPS_MAXLINES="$((${SCREEN_Y_RES} / ${EIPS_Y_RES}))"
+}
+
+check_version()
+{
+	# The great version check!
+	kpver="$(grep '^Kindle 5' ${ROOT}/etc/prettyversion.txt 2>&1)"
+	if [ $? -ne 0 ] ; then
+		logmsg "W" "check_version" "" "couldn't detect the kindle major version!"
+		# We're in a bit of a pickle... Make an educated guess...
+		if [ "${IS_PW2}" == "true" ] ; then
+			# The PW2 shipped on 5.4.0 ;)
+			logmsg "I" "check_version" "" "PW2 detected, assuming >= 5.4"
+			K5_ATLEAST_54="true"
+		elif [ "${IS_KV}" == "true" ] ; then
+			# The KV shipped on 5.5.0 ;)
+			logmsg "I" "check_version" "" "KV detected, assuming >= 5.4"
+			K5_ATLEAST_54="true"
+		elif [ "${IS_KT2}" == "true" ] ; then
+			# The KT2 shipped on 5.6.0 ;)
+			logmsg "I" "check_version" "" "KT2 detected, assuming >= 5.4"
+			K5_ATLEAST_54="true"
+		elif [ "${IS_PW3}" == "true" ] ; then
+			# The PW3 shipped on 5.6.1 ;)
+			logmsg "I" "check_version" "" "PW3 detected, assuming >= 5.4"
+			K5_ATLEAST_54="true"
+		else
+			# Poor man's last resort trick. See if we can find a new feature of FW 5.4 on the FS...
+			if [ -f ${ROOT}/etc/upstart/contentpackd.conf ] ; then
+				logmsg "I" "check_version" "" "found a fw >= 5.4 feature"
+				K5_ATLEAST_54="true"
+			fi
+			# NOTE: Alternative checks:
+			# -x ${ROOT}/usr/bin/contentpackd
+			# -f ${ROOT}/opt/amazon/ebook/lib/VocabBuilderSDK.jar
+			# -f ${ROOT}/opt/amazon/ebook/booklet/VocabBuilderBooklet.jar
+		fi
+	else
+		# Weeee, the great case switch!
+		khver="$(echo ${kpver} | sed -n -r 's/^(Kindle)([[:blank:]]*)([[:digit:].]*)(.*?)$/\3/p')"
+		case "${khver}" in
+			5.0* )
+				K5_ATLEAST_54="false"
+			;;
+			5.1* )
+				K5_ATLEAST_54="false"
+			;;
+			5.2* )
+				K5_ATLEAST_54="false"
+			;;
+			5.3* )
+				K5_ATLEAST_54="false"
+			;;
+			5.4* )
+				K5_ATLEAST_54="true"
+			;;
+			5.5* )
+				K5_ATLEAST_54="true"
+			;;
+			5.6* )
+				K5_ATLEAST_54="true"
+			;;
+			5.* )
+				# Assume newer, just to be safe ;)
+				K5_ATLEAST_54="true"
+			;;
+			* )
+				# Given the previous checks, this shouldn't be reachable, but cover all bases anyway...
+				logmsg "W" "check_version" "" "couldn't detect the kindle version!"
+				# Poor man's last resort trick. See if we can find a new feature of FW 5.4 on the FS...
+				if [ -f ${ROOT}/etc/upstart/contentpackd.conf ] ; then
+					logmsg "I" "check_version" "" "found a fw >= 5.4 feature"
+					K5_ATLEAST_54="true"
+				fi
+			;;
+		esac
+	fi
+}
+
+print_jb_install_feedback()
+{
+	# We need to know our model
+	check_model
+	# Prepare our stuff...
+	kh_eips_string="**** JAILBREAK ****"
+
+	# And finally, show our message, centered on the bottom of the screen
+	eips $(((${EIPS_MAXCHARS} - ${#kh_eips_string}) / 2)) $((${EIPS_MAXLINES} - 2)) "${kh_eips_string}"
+}
+
+print_fw54_exec_install_feedback()
+{
+	# We need to know our model
+	check_model
+	# Prepare our stuff...
+	kh_eips_string="**** FW 5.4 JB ****"
+
+	# And finally, show our message, centered on the bottom of the screen
+	eips $(((${EIPS_MAXCHARS} - ${#kh_eips_string}) / 2)) $((${EIPS_MAXLINES} - 2)) "${kh_eips_string}"
+}
+
+print_mkk_dev_keystore_feedback()
+{
+	# We need to know our model
+	check_model
+	# Prepare our stuff... Print an extra warning if we failed to copy the keys...
+	if [ "${VARLOCAL_OOS}" == "true" ] ; then
+		kh_eips_string="**** WARNING: FAILED TO COPY MKK KEYS ****"
+	else
+		kh_eips_string="**** MKK KEYS **** "
+	fi
+
+	# And finally, show our message, centered on the bottom of the screen
+	eips $(((${EIPS_MAXCHARS} - ${#kh_eips_string}) / 2)) $((${EIPS_MAXLINES} - 2)) "${kh_eips_string}"
+}
+
+print_mkk_kindlet_jb_feedback()
+{
+	# We need to know our model
+	check_model
+	# Prepare our stuff...
+	kh_eips_string="**** MKK K JB **** "
+
+	# And finally, show our message, centered on the bottom of the screen
+	eips $(((${EIPS_MAXCHARS} - ${#kh_eips_string}) / 2)) $((${EIPS_MAXLINES} - 2)) "${kh_eips_string}"
+}
+
+print_gandalf_feedback()
+{
+	# We need to know our model
+	check_model
+	# Prepare our stuff...
+	kh_eips_string=" **** GANDALF **** "
+
+	# And finally, show our message, centered on the bottom of the screen
+	eips $(((${EIPS_MAXCHARS} - ${#kh_eips_string}) / 2)) $((${EIPS_MAXLINES} - 2)) "${kh_eips_string}"
+}
+
+print_rp_feedback()
+{
+	# We need to know our model
+	check_model
+	# Prepare our stuff...
+	kh_eips_string="   **** RP ****    "
+
+	# And finally, show our message, centered on the bottom of the screen
+	eips $(((${EIPS_MAXCHARS} - ${#kh_eips_string}) / 2)) $((${EIPS_MAXLINES} - 2)) "${kh_eips_string}"
+}
+
+print_crp_feedback()
+{
+	# We need to know our model
+	check_model
+	# Prepare our stuff...
+	kh_eips_string="   **** CRP ****   "
+
+	# And finally, show our message, centered on the bottom of the screen
+	eips $(((${EIPS_MAXCHARS} - ${#kh_eips_string}) / 2)) $((${EIPS_MAXLINES} - 2)) "${kh_eips_string}"
+}
+
+print_bridge_job_feedback()
+{
+	# We need to know our model
+	check_model
+	# Prepare our stuff...
+	kh_eips_string=" **** BRIDGE+ **** "
+
+	# And finally, show our message, centered on the bottom of the screen
+	eips $(((${EIPS_MAXCHARS} - ${#kh_eips_string}) / 2)) $((${EIPS_MAXLINES} - 2)) "${kh_eips_string}"
+}
+
+install_touch_update_key()
+{
+	mount_root_rw
+	logmsg "I" "install_touch_update_key" "" "Copying the jailbreak updater key"
+	cat > "${ROOT}/etc/uks/pubdevkey01.pem" << EOF
+-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDJn1jWU+xxVv/eRKfCPR9e47lP
+WN2rH33z9QbfnqmCxBRLP6mMjGy6APyycQXg3nPi5fcb75alZo+Oh012HpMe9Lnp
+eEgloIdm1E4LOsyrz4kttQtGRlzCErmBGt6+cAVEV86y2phOJ3mLk0Ek9UQXbIUf
+rvyJnS2MKLG2cczjlQIDAQAB
+-----END PUBLIC KEY-----
+EOF
+	mount_ro
+
+	# Show some feedback
+	print_jb_install_feedback
+}
+
+install_fw54_exec_userstore_flag()
+{
+	# Make sure we're on FW >= 5.4...
+	check_model
+	check_version
+
+	if [ "${K5_ATLEAST_54}" == "true" ] ; then
+		mount_root_rw
+		logmsg "I" "install_fw54_exec_userstore_flag" "" "Creating the userstore exec flag file"
+		touch "${ROOT}/MNTUS_EXEC"
+		mount_ro
+
+		# Show some feedback
+		print_fw54_exec_install_feedback
+	fi
+}
+
+install_mkk_dev_keystore()
+{
+	logmsg "I" "install_mkk_dev_keystore" "" "Copying the kindlet keystore"
+	# We shouldn't need to do anything specific to read/write /var/local
+	if [ "$(df -k /var/local | awk '$3 ~ /[0-9]+/ { print $4 }')" -lt "512" ] ; then
+		# Hu ho... Keep track of this...
+		VARLOCAL_OOS="true"
+		logmsg "W" "install_mkk_dev_keystore" "" "Failed to copy the kindlet keystore: not enough space left on device"
+	else
+		cp -f "${MKK_PERSISTENT_STORAGE}/developer.keystore" "/var/local/java/keystore/developer.keystore"
+	fi
+
+	# Show some feedback
+	print_mkk_dev_keystore_feedback
+}
+
+install_mkk_kindlet_jb()
+{
+	mount_root_rw
+	logmsg "I" "install_mkk_kindlet_jb" "" "Copying the kindlet jailbreak"
+	cp -f "${MKK_PERSISTENT_STORAGE}/json_simple-1.1.jar" "${ROOT}/opt/amazon/ebook/lib/json_simple-1.1.jar"
+	chmod 0664 "${ROOT}/opt/amazon/ebook/lib/json_simple-1.1.jar"
+	mount_ro
+
+	# Show some feedback
+	print_mkk_kindlet_jb_feedback
+}
+
+setup_gandalf()
+{
+	logmsg "I" "setup_gandalf" "" "Setting up gandalf... you shall not pass!"
+	chmod a+x "${MKK_PERSISTENT_STORAGE}/gandalf"
+	chmod +s "${MKK_PERSISTENT_STORAGE}/gandalf"
+	ln -sf "${MKK_PERSISTENT_STORAGE}/gandalf" "${MKK_PERSISTENT_STORAGE}/su"
+
+	# Show some feedback
+	print_gandalf_feedback
+}
+
+install_rp()
+{
+	mount_root_rw
+	logmsg "I" "install_rp" "" "Copying the RP"
+	cp -f "${RP_PERSISTENT_STORAGE}/debrick.conf" "/etc/upstart/debrick.conf"
+	chmod 0664 "/etc/upstart/debrick.conf"
+	cp -f "${RP_PERSISTENT_STORAGE}/debrick" "/etc/upstart/debrick"
+	chmod 0755 "/etc/upstart/debrick"
+	mount_ro
+
+	# Show some feedback
+	print_rp_feedback
+}
+
+install_crp()
+{
+	mount_root_rw
+	logmsg "I" "install_crp" "" "Copying the CRP"
+	cp -f "${RP_PERSISTENT_STORAGE}/cowardsdebrick.conf" "/etc/upstart/cowardsdebrick.conf"
+	chmod 0664 "/etc/upstart/cowardsdebrick.conf"
+	# My version of CRP doesn't use a separate script ;)
+	if [ -f "${RP_PERSISTENT_STORAGE}/cowardsdebrick" ] ; then
+		cp -f "${RP_PERSISTENT_STORAGE}/cowardsdebrick" "/etc/upstart/cowardsdebrick"
+		chmod 0755 "/etc/upstart/cowardsdebrick"
+	fi
+	mount_ro
+
+	# Show some feedback
+	print_crp_feedback
+}
+
+install_bridge_job()
+{
+	mount_root_rw
+	logmsg "I" "install_bridge_job" "" "Copying the bridge job"
+	cp -f "${MKK_PERSISTENT_STORAGE}/bridge.conf" "/etc/upstart/bridge.conf"
+	chmod 0664 "/etc/upstart/bridge.conf"
+	mount_ro
+
+	# Show some feedback
+	print_bridge_job_feedback
+}
+
+clean_up()
+{
+	if [ -n "${ROOT}" ] ; then
+		logmsg "I" "clean_up" "" "Unmounting rootfs"
+		umount "${ROOT}"
+	fi
+}
+
+# Start with the userstore exec flag on FW >= 5.4 (so that the last eips print shown will make sense)
+if [ ! -f "${ROOT}/MNTUS_EXEC" ] ; then
+	install_fw54_exec_userstore_flag
+fi
+
+# Check if we need to do something with the OTA pubkey
+if [ ! -f "${ROOT}/etc/uks/pubdevkey01.pem" ] ; then
+	# No jailbreak key, install it
+	install_touch_update_key
+else
+	# Jailbreak key found... Check it.
+        if [ "$(md5sum "${ROOT}/etc/uks/pubdevkey01.pem" | awk '{ print $1; }')" != "7130ce39bb3596c5067cabb377c7a9ed" ] ; then
+		# Unknown (?) jailbreak key, install it
+		install_touch_update_key
+	fi
+fi
+
+# Check if we need to do something with the Kindlet developer keystore
+if [ -f "${MKK_PERSISTENT_STORAGE}/developer.keystore" ] ; then
+	# No developer keystore, install it
+	if [ ! -f "/var/local/java/keystore/developer.keystore" ] ; then
+		install_mkk_dev_keystore
+	else
+		# Developer keystore doesn't match, install it
+		# NOTE: This *will* mess with real, official developer keystores. Not that we really care about it, but it should be noted ;).
+		if [ "$(md5sum "/var/local/java/keystore/developer.keystore" | awk '{ print $1; }')" != "$(md5sum "${MKK_PERSISTENT_STORAGE}/developer.keystore" | awk '{ print $1; }')" ] ; then
+			install_mkk_dev_keystore
+		fi
+	fi
+fi
+
+# Check if we need to do something with the Kindlet JB
+if [ -f "${MKK_PERSISTENT_STORAGE}/json_simple-1.1.jar" ] ; then
+	# Kindlet JB doesn't match, install it
+	if [ "$(md5sum "${ROOT}/opt/amazon/ebook/lib/json_simple-1.1.jar" | awk '{ print $1; }')" != "$(md5sum "${MKK_PERSISTENT_STORAGE}/json_simple-1.1.jar" | awk '{ print $1; }')" ] ; then
+		install_mkk_kindlet_jb
+	fi
+fi
+
+# Check if we need to do something with Gandalf
+if [ -f "${MKK_PERSISTENT_STORAGE}/gandalf" ] ; then
+	# It's there, but not setup? Fix it!
+	if [ ! -x "${MKK_PERSISTENT_STORAGE}/su" ] ; then
+		setup_gandalf
+	fi
+fi
+
+# Check if we need to do something with the RP
+if [ -f "${RP_PERSISTENT_STORAGE}/debrick.conf" ] ; then
+	if [ ! -f "/etc/upstart/debrick.conf" ] ; then
+		install_rp
+	fi
+fi
+
+# Check if we need to do something with the CRP
+if [ -f "${RP_PERSISTENT_STORAGE}/cowardsdebrick.conf" ] ; then
+	if [ ! -f "/etc/upstart/cowardsdebrick.conf" ] ; then
+		install_crp
+	fi
+fi
+
+# Check if we need to do something with the bridge job
+if [ -f "${MKK_PERSISTENT_STORAGE}/bridge.conf" ] ; then
+	if [ ! -f "/etc/upstart/bridge.conf" ] ; then
+		install_bridge_job
+	fi
+fi
+
+# Nothing to do or cleanup...
+clean_up
+
+# And don't try anything fancier, the userstore isn't mounted yet...
+
+return 0
